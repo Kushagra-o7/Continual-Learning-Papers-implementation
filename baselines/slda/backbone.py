@@ -1,5 +1,5 @@
 """
-Deep SLDA – Backbone: ResNet-18 Feature Extractor
+Deep SLDA - Backbone: ResNet-18 Feature Extractor
 ==================================================
 The paper (Hayes & Kanan, CVPRW 2020) uses ONE backbone architecture:
 
@@ -25,9 +25,6 @@ All methods in the paper share the SAME offline base CNN initialization:
     for ALL streaming experiments (SLDA, iCaRL, ExStream, Fine-tuning, etc.).
   - The official checkpoint is provided by the authors at:
     https://github.com/tyler-hayes/Deep_SLDA (imagenet_files/imagenet_100_class_ckpt.pth)
-
-This initialization is critical: results from a differently-trained backbone
-will not reproduce the paper's numbers.
 """
 
 from __future__ import annotations
