@@ -1,0 +1,130 @@
+# =============================================================================
+#  RanPAC – Configuration (paper-faithful)
+# =============================================================================
+#  Paper:  McDonnell et al., "RanPAC: Random Projections and Pre-trained
+#          Models for Continual Learning", NeurIPS 2023.
+#
+#  Default: CIFAR-100 (224x224) with ViT-B/16 (IN-21k pretrained)
+#  This is the paper's primary benchmark configuration (Table 1, row 7).
+#
+#  Run with:
+#      python train.py --config config.yaml
+#
+# =============================================================================
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+# Paper benchmarks: cifar224, imageneta, imagenetr, cub, omnibenchmark, vtab, cars
+# Default: cifar224 (CIFAR-100 resized to 224x224)
+dataset: "cifar224"
+data_root: "./data"               # CIFAR-100 will be auto-downloaded here
+num_classes: 100                  # CIFAR-100 has 100 classes
+image_size: 224                   # Paper: all images resized to 224x224
+
+# ── Backbone (frozen, pre-trained) ──────────────────────────────────────────
+# Paper primary: ViT-B/16 pretrained on ImageNet-21k
+# Paper ablations: pretrained_resnet50, pretrained_resnet152,
+#                  vit_base_patch32_224_clip_laion2b
+backbone: "pretrained_vit_b16_224_in21k"
+feature_dim: 768                  # ViT-B/16 CLS token output
+
+# ── RanPAC Hyperparameters (paper Section 4 / Table 1) ──────────────────────
+# use_RP: whether to use random projection + ridge regression
+#   True  -> RanPAC (paper's method): RP + ridge regression
+#   False -> NCM baseline (cosine similarity with class prototypes)
+use_RP: true
+
+# M: random projection output dimensionality
+#   Paper default: 10000
+#   M=0  -> decorrelation only (no RP, but still ridge regression)
+#   M=-1 -> no RP, no ridge regression (NCM only, use_RP must be false)
+M: 10000
+
+# Ridge parameter lambda is optimised automatically via grid search
+# over {10^{-8}, ..., 10^{8}} using 80/20 validation split (paper protocol)
+
+# ── Class-Incremental Protocol (paper Section 4) ─────────────────────────────
+# Paper: init_cls=10, increment=10 for CIFAR-100 (10 tasks of 10 classes)
+# If init_cls == increment: all tasks have equal size
+init_cls: 10                      # Number of classes in the first task
+increment: 10                     # Number of new classes per subsequent task
+
+# ── Class ordering ───────────────────────────────────────────────────────────
+# Paper: classes are shuffled with a fixed seed
+shuffle: true                     # Shuffle class order (paper: true)
+
+# ── PETL Phase 1 (optional, first task only) ─────────────────────────────────
+# model_name controls whether Phase 1 PETL is used:
+#   'ncm'    -> no PETL, only Phase 2 (for backbones without adapters)
+#   'adapter' -> Phase 1 adapter fine-tuning on first task
+# Paper Table 1 row 7 uses adapter PETL with ViT backbone
+model_name: "ncm"                 # 'ncm' for no PETL, 'adapter' for PETL
+
+# PETL hyperparameters (only used when model_name != 'ncm')
+tuned_epoch: 20                   # SGD epochs for Phase 1 (paper: 20)
+body_lr: 0.01                     # Learning rate for Phase 1 (paper: 0.01)
+head_lr: 0.01                     # Head LR for Phase 1 (paper: 0.01)
+weight_decay: 0.0005              # Weight decay (paper: 0.0005)
+min_lr: 0.0                       # Minimum LR for cosine annealing (paper: 0.0)
+
+# ── Evaluation ───────────────────────────────────────────────────────────────
+batch_size: 128                   # Feature extraction + evaluation batch size
+
+# ── Reproducibility ──────────────────────────────────────────────────────────
+seed: 1993                        # Random seed (paper default: 1993)
+
+# ── Runtime ──────────────────────────────────────────────────────────────────
+num_workers: 8                    # DataLoader workers
+
+# ── Checkpointing ────────────────────────────────────────────────────────────
+save_dir: "./results/ranpac_cifar224"
+resume_checkpoint: null           # Path to .pth to resume
+
+# ── Input normalization ──────────────────────────────────────────────────────
+# Official code applies input normalization to ResNet features (not ViT)
+# This is the 'use_input_norm' flag in the official CSV configs
+use_input_norm: false             # true for ResNet backbones, false for ViT
+
+# ── Device ───────────────────────────────────────────────────────────────────
+device: "cuda"                    # 'cuda' or 'cpu'
+
+# =============================================================================
+#  Paper expected results (Table 1, CIFAR-100 10-task CIL with ViT-B/16):
+#
+#    Method                              Avg Inc. Acc
+#    NCM (no PETL)                       ~86.3%
+#    RanPAC w/o RP (decorrelation only)  ~88.7%
+#    RanPAC (M=10000)                    ~90.9%
+#    RanPAC + Adapter PETL               ~92.7%
+#
+#  With ResNet-50 backbone (no PETL):
+#    NCM                                 ~63.1%
+#    RanPAC w/o RP                       ~72.1%
+#    RanPAC (M=10000)                    ~72.1%
+#
+# =============================================================================
+
+# =============================================================================
+#  PRESET CONFIGS (uncomment one block to switch)
+# =============================================================================
+
+# --- RanPAC with Adapter PETL (paper row 7 -- best result) ---
+# model_name: "adapter"
+# backbone: "pretrained_vit_b16_224_in21k"
+# use_RP: true
+# M: 10000
+# tuned_epoch: 20
+# body_lr: 0.01
+
+# --- RanPAC without RP (decorrelation only, paper row 6) ---
+# use_RP: true
+# M: 0
+
+# --- NCM baseline (paper row 2) ---
+# use_RP: false
+# M: -1
+
+# --- ResNet-50 backbone (paper rows 8-10) ---
+# backbone: "pretrained_resnet50"
+# feature_dim: 2048
+# model_name: "ncm"
+# use_input_norm: true
