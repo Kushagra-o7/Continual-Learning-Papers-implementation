@@ -1,0 +1,65 @@
+# =============================================================================
+#  Deep SLDA – Configuration (CIFAR-100, default)
+# =============================================================================
+#
+#  Paper:  Hayes & Kanan, CVPRW 2020
+#  Title:  Lifelong Machine Learning with Deep Streaming Linear Discriminant
+#          Analysis
+#
+#  Run with:
+#      python train.py --config config.yaml
+#
+# =============================================================================
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+dataset: "cifar100"       # Options: cifar100 | tiny-imagenet | imagenet
+data_root: "./data"       # Where to download / find the dataset
+num_classes: 100          # Total classes in the dataset (CIFAR-100 = 100)
+
+# ── Backbone (frozen feature extractor) ──────────────────────────────────────
+# Paper uses ResNet-18.  The backbone is completely frozen during SLDA training.
+backbone: "resnet18"          # Options: resnet18 | resnet34 | resnet50 | resnet101 | vgg16_bn
+feature_dim: 512              # Output dimension of the backbone (resnet18 → 512)
+imagenet_pretrained: true     # Use ImageNet-pretrained ResNet-18 weights
+backbone_checkpoint: null     # Path to a custom .pth backbone checkpoint (optional)
+                              # If set, imagenet_pretrained is ignored.
+feature_layer: "avgpool"      # Feature extraction point (kept for API compat)
+
+# ── SLDA Hyperparameters ─────────────────────────────────────────────────────
+# All values match Table 1 / Section 4 of the paper.
+shrinkage_param: 1.0e-4       # ε for precision matrix regularisation (paper default)
+streaming_update_sigma: true  # True: online Σ updates; False: freeze Σ after base-init
+                              # Paper ablates both; streaming=True is their main result.
+
+# ── Class-Incremental Protocol ───────────────────────────────────────────────
+base_classes: 10              # Classes used in the OAS-init base phase (first increment)
+class_increment: 10           # Number of new classes revealed per streaming increment
+                              # Paper uses 100-class increments on ImageNet (1000 classes)
+                              # For CIFAR-100 with 10-class increments, set to 10.
+
+# ── Training / Evaluation ────────────────────────────────────────────────────
+batch_size: 256               # Batch size for feature extraction & evaluation
+test_batch_size: 1024         # Internal mini-batch size for predict() (memory limit)
+shuffle_data: false           # Paper: False (class-ordered stream, no shuffling)
+num_workers: 4                # DataLoader workers
+
+# ── Reproducibility ──────────────────────────────────────────────────────────
+seed: 0                       # Random seed (torch, numpy, random)
+
+# ── Checkpointing ────────────────────────────────────────────────────────────
+save_dir: "./results/slda_cifar100"   # Directory where checkpoints & results are saved
+resume_checkpoint: null               # Set to a .pth path to resume (e.g. for eval only)
+
+# =============================================================================
+#  ImageNet config example (uncomment and adjust)
+# =============================================================================
+# dataset: "imagenet"
+# data_root: "/path/to/imagenet"
+# num_classes: 1000
+# backbone: "resnet18"
+# feature_dim: 512
+# imagenet_pretrained: false
+# backbone_checkpoint: "./imagenet_files/imagenet_100_class_ckpt.pth"
+# base_classes: 100
+# class_increment: 100
+# save_dir: "./results/slda_imagenet"
