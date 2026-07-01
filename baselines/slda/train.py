@@ -1,25 +1,40 @@
 """
 Deep SLDA – Training & Evaluation Script
 =========================================
-Entry point for reproducing the CVPRW-2020 Deep SLDA results.
+Faithful reproduction of the CVPRW-2020 paper experiments.
+
+Paper:   Hayes & Kanan, "Lifelong Machine Learning with Deep Streaming
+         Linear Discriminant Analysis", CVPR Workshops 2020.
+
+Dataset: ImageNet-1000 (ILSVRC 2012). The ONLY dataset used in the paper.
+
+Protocol (paper Section 4):
+1.  ResNet-18 is pre-trained OFFLINE on the first 100 ImageNet classes.
+    This is the "base CNN initialization" shared by ALL methods in the paper.
+    Checkpoint: imagenet_files/imagenet_100_class_ckpt.pth  (from authors' repo)
+2.  The 100-class base training data is used to initialise SLDA statistics
+    via fit_base() (exact class means + OAS covariance).
+3.  The remaining 900 classes arrive as a stream, 100 classes per increment,
+    one sample at a time. fit() is called for each sample.
+4.  After each 100-class increment:
+    - top-1 / top-5 accuracy on all SEEN classes is computed.
+    - Omega_all is accumulated towards its final value.
+5.  Omega_all (paper's PRIMARY metric, Table 1) is reported at the end.
+
+Primary metric -- Omega_all (paper Eq. 1):
+    Omega_all = (1/T) * sum_{t=1}^{T} (alpha_t / alpha_offline_t)
+
+    alpha_t         : streaming SLDA accuracy after seeing t increments.
+    alpha_offline_t : offline LDA accuracy trained on ALL data seen so far at t.
+    T               : total number of increments (900/100 = 9 for ImageNet).
+
+    alpha_offline_t is computed by fitting a FRESH OAS-LDA on all features
+    extracted from the backbone for classes 0..t*class_increment, then
+    evaluating on the test set for the same classes. This is the exact
+    "offline upper bound" described in the paper.
 
 Usage:
     python train.py --config config.yaml
-
-The script follows the paper's protocol exactly:
-
-1. A frozen ResNet backbone extracts features from images.
-2. The first ``base_classes`` classes are used to initialise Σ via OAS
-   (fit_base).  All subsequent classes arrive one-sample-at-a-time
-   (fit / fit_batch).
-3. After each class-increment evaluation is performed on all seen classes
-   and the model checkpoint is saved.
-4. Final top-1 / top-5 accuracy is reported at the end.
-
-Supported datasets (add more in ``get_dataset``):
-  - CIFAR-100   (100 classes, 500 train / 100 test per class)
-  - Tiny-ImageNet (200 classes, 500 train / 50 test per class)
-  - ImageNet    (1000 classes – requires manual download)
 """
 
 import argparse
@@ -27,6 +42,7 @@ import json
 import os
 import random
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -35,12 +51,12 @@ from torch.utils.data import DataLoader, Subset
 
 from backbone import get_backbone
 from model import StreamingLDA
-from utils import AverageMeter, accuracy, get_dataset
+from utils import AverageMeter, accuracy, get_imagenet_loader
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # Reproducibility
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 
 def set_seed(seed: int) -> None:
     """Fix all random seeds for fully deterministic runs."""
@@ -52,19 +68,19 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-# --------------------------------------------------------------------------- #
-# Feature extraction helpers
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Feature extraction
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def extract_features(
     loader: DataLoader,
     backbone: torch.nn.Module,
     device: str,
-    desc: str = "Extracting features",
-) -> tuple[torch.Tensor, torch.Tensor]:
+    desc: str = "Extracting",
+) -> tuple:
     """
-    Run the entire loader through the frozen backbone and collect features.
+    Forward all images through the frozen backbone, return (features, labels).
 
     Returns
     -------
@@ -72,44 +88,110 @@ def extract_features(
     labels   : Tensor (N,) long
     """
     backbone.eval()
-    all_feats, all_labels = [], []
+    feats_list, labels_list = [], []
+    n_done = 0
     for imgs, labels in loader:
         imgs = imgs.to(device)
-        feats = backbone(imgs)                  # (B, d)
-        all_feats.append(feats.cpu())
-        all_labels.append(labels)
-        print(f"\r[{desc}] {sum(len(f) for f in all_feats)}/{len(loader.dataset)}",
-              end="", flush=True)
+        feats = backbone(imgs)          # (B, d)
+        feats_list.append(feats.cpu())
+        labels_list.append(labels)
+        n_done += imgs.size(0)
+        print(f"\r[{desc}] {n_done}/{len(loader.dataset)}", end="", flush=True)
     print()
-    return torch.cat(all_feats, dim=0), torch.cat(all_labels, dim=0)
+    return torch.cat(feats_list, 0), torch.cat(labels_list, 0)
 
 
-# --------------------------------------------------------------------------- #
-# Class-incremental data helpers
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Offline upper-bound LDA (for Omega_all computation)
+# ---------------------------------------------------------------------------
 
-def get_class_loader(
+def compute_offline_lda_accuracy(
+    train_feats: torch.Tensor,
+    train_labels: torch.Tensor,
+    test_feats: torch.Tensor,
+    test_labels: torch.Tensor,
+    num_classes: int,
+    shrinkage_param: float,
+    device: str,
+) -> tuple:
+    """
+    Fit a FRESH offline (non-streaming) LDA on (train_feats, train_labels)
+    and evaluate on (test_feats, test_labels).
+
+    This is the alpha_offline_t computation required for Omega_all.
+    The offline LDA uses OAS covariance (same as fit_base) -- giving an
+    upper bound that is fair to compare against SLDA.
+
+    Returns
+    -------
+    top1, top5 : float  (percentages)
+    """
+    feature_dim = train_feats.shape[1]
+
+    # Build a fresh StreamingLDA and run fit_base (OAS init) on all seen data
+    offline_clf = StreamingLDA(
+        feature_dim=feature_dim,
+        num_classes=num_classes,
+        shrinkage_param=shrinkage_param,
+        streaming_update_sigma=False,   # covariance fixed after OAS init
+        device=device,
+    )
+    # Suppress Lambda recompute message for offline runs
+    offline_clf.fit_base(train_feats, train_labels)
+
+    scores = offline_clf.predict(test_feats, return_probas=False)
+    t1, t5 = accuracy(scores, test_labels, topk=(1, min(5, num_classes)))
+    return t1.item(), t5.item()
+
+
+# ---------------------------------------------------------------------------
+# Evaluation helpers
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate_streaming(
+    classifier: StreamingLDA,
+    backbone: torch.nn.Module,
+    loader: DataLoader,
+    device: str,
+    num_classes: int,
+) -> tuple:
+    """
+    Compute top-1 and top-5 accuracy of the streaming SLDA classifier.
+
+    Returns
+    -------
+    top1, top5 : float (percentages)
+    """
+    backbone.eval()
+    top1_m, top5_m = AverageMeter(), AverageMeter()
+    for imgs, labels in loader:
+        feats = backbone(imgs.to(device))
+        scores = classifier.predict(feats, return_probas=False)
+        t1, t5 = accuracy(scores, labels, topk=(1, min(5, num_classes)))
+        top1_m.update(t1.item(), imgs.size(0))
+        top5_m.update(t5.item(), imgs.size(0))
+    return top1_m.avg, top5_m.avg
+
+
+# ---------------------------------------------------------------------------
+# Class-filtered data loader
+# ---------------------------------------------------------------------------
+
+def make_class_loader(
     dataset,
-    class_indices: list[int],
+    class_range: list,
     batch_size: int,
     shuffle: bool,
-    num_workers: int = 4,
+    num_workers: int,
 ) -> DataLoader:
-    """
-    Return a DataLoader restricted to samples whose label is in
-    ``class_indices``.
-    """
-    # Prefer the fast `.targets` list attribute (exists in CIFAR, ImageNet, TinyImageNet)
-    if hasattr(dataset, "targets"):
-        raw = dataset.targets
-        targets = torch.tensor(raw if not isinstance(raw, torch.Tensor) else raw.tolist())
-    else:
-        # Fallback: iterate the dataset (slow, use only for custom datasets)
-        targets = torch.tensor([dataset[i][1] for i in range(len(dataset))])
-    indices = torch.where(torch.isin(targets, torch.tensor(class_indices)))[0].tolist()
-    subset = Subset(dataset, indices)
+    """Return a DataLoader restricted to samples in class_range."""
+    targets = _get_targets(dataset)
+    indices = torch.where(
+        torch.isin(targets, torch.tensor(class_range))
+    )[0].tolist()
     return DataLoader(
-        subset,
+        Subset(dataset, indices),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
@@ -117,86 +199,74 @@ def get_class_loader(
     )
 
 
-# --------------------------------------------------------------------------- #
-# Evaluation
-# --------------------------------------------------------------------------- #
-
-@torch.no_grad()
-def evaluate(
-    classifier: StreamingLDA,
-    backbone: torch.nn.Module,
-    loader: DataLoader,
-    device: str,
-    num_classes: int,
-) -> tuple[float, float]:
-    """
-    Compute top-1 and top-5 accuracy over the provided loader.
-
-    Returns
-    -------
-    top1, top5 : float   (percentage)
-    """
-    backbone.eval()
-    top1_meter = AverageMeter()
-    top5_meter = AverageMeter()
-
-    for imgs, labels in loader:
-        imgs = imgs.to(device)
-        feats = backbone(imgs)                                  # (B, d)
-        scores = classifier.predict(feats, return_probas=False) # (B, C)
-        t1, t5 = accuracy(scores, labels, topk=(1, min(5, num_classes)))
-        top1_meter.update(t1.item(), imgs.size(0))
-        top5_meter.update(t5.item(), imgs.size(0))
-
-    return top1_meter.avg, top5_meter.avg
+def _get_targets(dataset) -> torch.Tensor:
+    """Extract integer label tensor from a dataset quickly."""
+    if hasattr(dataset, "targets"):
+        raw = dataset.targets
+        return torch.tensor(raw if not isinstance(raw, torch.Tensor) else raw.tolist())
+    # Fallback (slow)
+    return torch.tensor([dataset[i][1] for i in range(len(dataset))])
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # Main experiment loop
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 
 def run_experiment(cfg: dict) -> None:
     """
-    Execute the full class-incremental SLDA experiment described in the paper.
+    Execute the class-incremental SLDA experiment from the paper.
 
-    Protocol
-    --------
-    * Classes [0, base_classes) → base initialisation (fit_base)
-    * Classes [base_classes, num_classes) → streaming updates (fit / fit_batch)
-    * After each increment: evaluate on all seen classes, save checkpoint
+    Implements the full evaluation protocol including Omega_all.
     """
-    # -- device & seed ------------------------------------------------------- #
     device = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     set_seed(cfg["seed"])
-    print(f"\n[SLDA] Device: {device}  |  Seed: {cfg['seed']}")
+    print(f"\n[SLDA] Device: {device} | Seed: {cfg['seed']}")
+    print(f"[SLDA] Dataset: {cfg['dataset']}  (paper uses ImageNet-1000)")
 
-    # -- output directory ---------------------------------------------------- #
     save_dir = cfg["save_dir"]
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
 
-    # -- dataset ------------------------------------------------------------- #
-    train_dataset, test_dataset = get_dataset(
-        name=cfg["dataset"],
-        data_root=cfg["data_root"],
-    )
+    # -----------------------------------------------------------------------
+    # Dataset (paper: ImageNet-1000 only)
+    # -----------------------------------------------------------------------
+    dataset_name = cfg["dataset"].lower()
+    if dataset_name != "imagenet":
+        print(
+            f"[SLDA] WARNING: dataset='{dataset_name}'. "
+            "The paper ONLY uses ImageNet-1000. "
+            "Results on other datasets will NOT reproduce the paper's numbers."
+        )
 
-    # -- backbone ------------------------------------------------------------ #
-    backbone = get_backbone(
+    train_dataset, test_dataset = _load_dataset(cfg)
+
+    # -----------------------------------------------------------------------
+    # Backbone -- ResNet-18 pre-trained on base 100 classes (paper protocol)
+    # -----------------------------------------------------------------------
+    backbone, feature_dim = get_backbone(
         arch=cfg["backbone"],
         pretrained=cfg.get("imagenet_pretrained", False),
         checkpoint=cfg.get("backbone_checkpoint", None),
-        feature_layer=cfg.get("feature_layer", "avgpool"),
-    ).to(device)
-    backbone.eval()
-    # Freeze backbone weights – no gradients needed
+    )
+    backbone = backbone.to(device)
+
+    # Verify feature_dim matches config
+    if feature_dim != cfg["feature_dim"]:
+        print(
+            f"[SLDA] WARNING: backbone yields feature_dim={feature_dim} but "
+            f"config says feature_dim={cfg['feature_dim']}. Using {feature_dim}."
+        )
+        cfg["feature_dim"] = feature_dim
+
+    # Freeze backbone permanently
     for p in backbone.parameters():
         p.requires_grad_(False)
+    backbone.eval()
 
-    feature_dim = cfg["feature_dim"]
-
-    # -- classifier ---------------------------------------------------------- #
+    # -----------------------------------------------------------------------
+    # Streaming classifier
+    # -----------------------------------------------------------------------
     classifier = StreamingLDA(
         feature_dim=feature_dim,
         num_classes=cfg["num_classes"],
@@ -206,180 +276,267 @@ def run_experiment(cfg: dict) -> None:
         device=device,
     )
 
-    # Check if we resume from an existing checkpoint
     resume_ckpt = cfg.get("resume_checkpoint", None)
     if resume_ckpt is not None:
-        ckpt_dir, ckpt_name = os.path.split(resume_ckpt)
-        ckpt_name = ckpt_name.replace(".pth", "")
-        classifier.load_model(ckpt_dir, ckpt_name)
-        print(f"[SLDA] Resumed from {resume_ckpt}")
+        ckpt_dir, ckpt_fname = os.path.split(resume_ckpt)
+        classifier.load_model(ckpt_dir, ckpt_fname.replace(".pth", ""))
 
-    # -- incremental training ------------------------------------------------ #
-    num_classes: int = cfg["num_classes"]
-    base_classes: int = cfg["base_classes"]
-    class_increment: int = cfg["class_increment"]
-    batch_size: int = cfg["batch_size"]
-    shuffle_data: bool = cfg.get("shuffle_data", False)
-    num_workers: int = cfg.get("num_workers", 4)
+    # -----------------------------------------------------------------------
+    # Pre-extract ALL training features upfront for Omega_all computation.
+    # (offline upper bound requires features of all seen classes at each step)
+    # -----------------------------------------------------------------------
+    compute_omega = cfg.get("compute_omega_all", True)
+    all_train_feats = None
+    all_train_labels = None
 
-    accuracies = {"seen_top1": [], "seen_top5": [], "classes_seen": []}
+    if compute_omega:
+        print("\n[SLDA] Pre-extracting all training features for Omega_all ...")
+        all_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg["batch_size"],
+            shuffle=False,
+            num_workers=cfg.get("num_workers", 4),
+            pin_memory=True,
+        )
+        all_train_feats, all_train_labels = extract_features(
+            all_loader, backbone, device, desc="All train features"
+        )
+        print(f"[SLDA] Cached {all_train_feats.shape[0]} training features.")
+
+    # -----------------------------------------------------------------------
+    # Incremental loop
+    # -----------------------------------------------------------------------
+    num_classes    = cfg["num_classes"]
+    base_classes   = cfg["base_classes"]       # Paper: 100
+    class_increment= cfg["class_increment"]    # Paper: 100
+    batch_size     = cfg["batch_size"]
+    shuffle_data   = cfg.get("shuffle_data", False)   # Paper: False
+    num_workers    = cfg.get("num_workers", 4)
+
+    # Paper: all classes up to base_classes are a single "base increment"
+    # followed by streaming increments of size class_increment.
+    # We implement this as: first increment = [0, base_classes),
+    # subsequent increments = [base_classes + k*class_increment, ...) for k=0,1,...
+    increments = [list(range(0, base_classes))]
+    for start in range(base_classes, num_classes, class_increment):
+        increments.append(list(range(start, min(start + class_increment, num_classes))))
+
+    T = len(increments)          # total number of increments (T in the paper)
+    omega_ratios = []            # alpha_t / alpha_offline_t for each t
+
+    results = {
+        "seen_top1":           [],
+        "seen_top5":           [],
+        "offline_top1":        [],
+        "offline_top5":        [],
+        "omega_ratio":         [],
+        "omega_all":           None,
+        "classes_seen":        [],
+        "config": cfg,
+    }
+
     start_time = time.time()
     first_increment = True
+    seen_classes: list = []
 
-    for class_start in range(0, num_classes, class_increment):
-        class_end = min(class_start + class_increment, num_classes)
-        class_range = list(range(class_start, class_end))
+    for inc_idx, class_range in enumerate(increments):
+        class_end = class_range[-1] + 1
+        seen_classes.extend(class_range)
         print(f"\n{'='*60}")
-        print(f"[SLDA] Training classes {class_start} – {class_end - 1}")
+        print(f"[SLDA] Increment {inc_idx+1}/{T}: classes {class_range[0]}-{class_range[-1]}")
 
-        train_loader = get_class_loader(
+        train_loader = make_class_loader(
             train_dataset, class_range, batch_size, shuffle_data, num_workers
         )
 
-        # ------------------------------------------------------------------- #
-        # Base initialisation (first increment only)
-        # ------------------------------------------------------------------- #
+        # -------------------------------------------------------------------
+        # SLDA update
+        # -------------------------------------------------------------------
         if first_increment:
-            print("[SLDA] Collecting base-init features ...")
+            # Base init: exact means + OAS covariance
+            print("[SLDA] Collecting base features for OAS init ...")
             base_feats, base_labels = extract_features(
                 train_loader, backbone, device, desc="Base init"
             )
-            # Paper: base_classes defines the first increment used for OAS init.
-            # If class_increment == base_classes this is exactly one batch.
             classifier.fit_base(base_feats, base_labels)
             first_increment = False
 
-        # ------------------------------------------------------------------- #
-        # Streaming updates (all subsequent increments, one sample at a time)
-        # ------------------------------------------------------------------- #
         else:
+            # Streaming: one sample at a time (paper protocol)
             n_batches = len(train_loader)
-            for batch_ix, (imgs, labels) in enumerate(train_loader):
-                imgs = imgs.to(device)
-                with torch.no_grad():
-                    feats = backbone(imgs)       # (B, d)
-
-                # Paper: SLDA is fitted one sample at a time
+            for b_idx, (imgs, labels) in enumerate(train_loader):
+                feats = backbone(imgs.to(device))
                 classifier.fit_batch(feats, labels)
-
-                print(
-                    f"\r[SLDA] Fitting {batch_ix + 1}/{n_batches} batches",
-                    end="", flush=True,
-                )
+                print(f"\r[SLDA] Streaming {b_idx+1}/{n_batches} batches", end="", flush=True)
             print()
 
-        # ------------------------------------------------------------------- #
-        # Evaluation on all seen classes
-        # ------------------------------------------------------------------- #
-        seen_classes = list(range(class_end))
-        test_loader = get_class_loader(
+        # -------------------------------------------------------------------
+        # Evaluate streaming SLDA on all seen classes
+        # -------------------------------------------------------------------
+        test_loader = make_class_loader(
             test_dataset, seen_classes, batch_size, False, num_workers
         )
-        top1, top5 = evaluate(classifier, backbone, test_loader, device, num_classes)
-        print(
-            f"[SLDA] Seen classes 0–{class_end-1}: "
-            f"top-1={top1:.2f}%  top-5={top5:.2f}%"
+        top1, top5 = evaluate_streaming(
+            classifier, backbone, test_loader, device, num_classes
         )
+        print(f"[SLDA] Streaming  top-1={top1:.2f}%  top-5={top5:.2f}%")
 
-        accuracies["seen_top1"].append(top1)
-        accuracies["seen_top5"].append(top5)
-        accuracies["classes_seen"].append(class_end)
+        # -------------------------------------------------------------------
+        # Compute offline upper bound (alpha_offline_t) for Omega_all
+        # -------------------------------------------------------------------
+        offline_top1, offline_top5 = 0.0, 0.0
+        ratio = 0.0
 
-        # Save per-increment accuracies
-        with open(os.path.join(save_dir, "accuracies.json"), "w") as f:
-            json.dump(accuracies, f, indent=2)
+        if compute_omega and all_train_feats is not None:
+            seen_mask = torch.isin(all_train_labels, torch.tensor(seen_classes))
+            off_train_feats  = all_train_feats[seen_mask]
+            off_train_labels = all_train_labels[seen_mask]
 
-        # Save checkpoint after each increment
-        ckpt_name = f"slda_min0_max{class_end}"
+            # Extract test features for seen classes
+            test_feats, test_labels = extract_features(
+                test_loader, backbone, device, desc="Offline test"
+            )
+
+            print("[SLDA] Computing offline LDA upper bound ...")
+            offline_top1, offline_top5 = compute_offline_lda_accuracy(
+                off_train_feats, off_train_labels,
+                test_feats, test_labels,
+                num_classes=num_classes,
+                shrinkage_param=cfg["shrinkage_param"],
+                device=device,
+            )
+            print(f"[SLDA] Offline LDA top-1={offline_top1:.2f}%  top-5={offline_top5:.2f}%")
+
+            if offline_top1 > 0:
+                ratio = top1 / offline_top1
+            omega_ratios.append(ratio)
+            print(f"[SLDA] alpha_t/alpha_offline_t = {ratio:.4f}")
+
+        # -------------------------------------------------------------------
+        # Log
+        # -------------------------------------------------------------------
+        results["seen_top1"].append(top1)
+        results["seen_top5"].append(top5)
+        results["offline_top1"].append(offline_top1)
+        results["offline_top5"].append(offline_top5)
+        results["omega_ratio"].append(ratio)
+        results["classes_seen"].append(class_end)
+
+        with open(os.path.join(save_dir, "results.json"), "w") as f:
+            json.dump(results, f, indent=2)
+
+        ckpt_name = f"slda_after_increment_{inc_idx+1:02d}_max_class_{class_end}"
         classifier.save_model(save_dir, ckpt_name)
 
-    # -- Final evaluation ---------------------------------------------------- #
-    print(f"\n{'='*60}")
-    print("[SLDA] Final evaluation on full test set ...")
-    full_test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-    final_top1, final_top5 = evaluate(
-        classifier, backbone, full_test_loader, device, num_classes
-    )
+    # -----------------------------------------------------------------------
+    # Final Omega_all  (paper's primary reported metric)
+    # -----------------------------------------------------------------------
     elapsed = time.time() - start_time
 
-    print(f"\n[SLDA] FINAL: top-1={final_top1:.2f}%  top-5={final_top5:.2f}%")
-    print(f"[SLDA] Total training time: {elapsed/60:.1f} min")
+    if compute_omega and omega_ratios:
+        omega_all = float(np.mean(omega_ratios))
+        results["omega_all"] = omega_all
+        print(f"\n{'='*60}")
+        print(f"[SLDA] Omega_all = {omega_all:.4f}   (primary paper metric)")
+        print(f"       = (1/{T}) * sum_t(alpha_t / alpha_offline_t)")
+    else:
+        omega_all = None
+        print("\n[SLDA] Omega_all not computed (compute_omega_all=false).")
 
-    accuracies["final_top1"] = final_top1
-    accuracies["final_top5"] = final_top5
-    accuracies["total_time_seconds"] = elapsed
-    with open(os.path.join(save_dir, "accuracies.json"), "w") as f:
-        json.dump(accuracies, f, indent=2)
+    final_top1 = results["seen_top1"][-1]
+    final_top5 = results["seen_top5"][-1]
+    print(f"[SLDA] Final streaming accuracy:  top-1={final_top1:.2f}%  top-5={final_top5:.2f}%")
+    print(f"[SLDA] Total time: {elapsed/60:.1f} min")
+
+    results["final_top1"] = final_top1
+    results["final_top5"] = final_top5
+    results["total_seconds"] = elapsed
+
+    with open(os.path.join(save_dir, "results.json"), "w") as f:
+        json.dump(results, f, indent=2)
 
     classifier.save_model(save_dir, "slda_final")
 
+    print(f"\n[SLDA] Results saved to: {save_dir}/results.json")
+    _print_summary(results, omega_ratios, T)
 
-# --------------------------------------------------------------------------- #
+
+def _print_summary(results: dict, omega_ratios: list, T: int) -> None:
+    """Print a clean summary table of per-increment results."""
+    print(f"\n{'='*70}")
+    print(f"{'Increment':>10} {'Classes':>8} {'SLDA Top1':>10} {'Offline Top1':>13} {'Ratio':>8}")
+    print(f"{'-'*70}")
+    for i, (c, a, o, r) in enumerate(zip(
+        results["classes_seen"],
+        results["seen_top1"],
+        results["offline_top1"],
+        results["omega_ratio"],
+    )):
+        print(f"{i+1:>10} {c:>8} {a:>9.2f}% {o:>12.2f}% {r:>8.4f}")
+    print(f"{'='*70}")
+    if results["omega_all"] is not None:
+        print(f"Omega_all (primary metric) = {results['omega_all']:.4f}")
+    print(f"{'='*70}\n")
+
+
+# ---------------------------------------------------------------------------
+# Dataset factory (ImageNet only, as in paper)
+# ---------------------------------------------------------------------------
+
+def _load_dataset(cfg: dict) -> tuple:
+    """
+    Load the dataset.  Paper uses ImageNet-1000 only.
+    Other datasets are accepted but emit a clear warning.
+    """
+    name = cfg["dataset"].lower()
+    root = cfg["data_root"]
+
+    if name == "imagenet":
+        return get_imagenet_loader(root, cfg["batch_size"], cfg.get("num_workers", 4))
+    else:
+        # Allow other datasets as extensions but warn loudly
+        print(
+            f"\n[SLDA] WARNING: '{name}' is not a paper dataset.\n"
+            "Paper only uses ImageNet-1000. Using this dataset will NOT\n"
+            "reproduce the paper's numbers or the Omega_all metric as reported.\n"
+        )
+        from utils import get_dataset_generic
+        return get_dataset_generic(name, root, cfg.get("image_size", 224))
+
+
+# ---------------------------------------------------------------------------
 # CLI
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Deep SLDA – Lifelong Machine Learning with Streaming LDA"
+    p = argparse.ArgumentParser(
+        description="Deep SLDA – Hayes & Kanan, CVPRW 2020 (ImageNet)"
     )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config.yaml",
-        help="Path to the YAML configuration file.",
+    p.add_argument("--config", type=str, default="config.yaml")
+    # CLI overrides (only applied if explicitly set)
+    p.add_argument("--data_root",  type=str, default=None)
+    p.add_argument("--save_dir",   type=str, default=None)
+    p.add_argument("--seed",       type=int, default=None)
+    p.add_argument("--resume_checkpoint", type=str, default=None)
+    p.add_argument(
+        "--no_omega", action="store_true",
+        help="Skip Omega_all computation (faster, skips offline LDA upper bound)."
     )
-    # Allow overriding individual config values from the command line
-    parser.add_argument(
-        "--dataset",       type=str,   default=None, help="Override dataset name."
-    )
-    parser.add_argument(
-        "--data_root",     type=str,   default=None, help="Override data root path."
-    )
-    parser.add_argument(
-        "--save_dir",      type=str,   default=None, help="Override save directory."
-    )
-    parser.add_argument(
-        "--seed",          type=int,   default=None, help="Override random seed."
-    )
-    parser.add_argument(
-        "--num_classes",   type=int,   default=None, help="Override num_classes."
-    )
-    parser.add_argument(
-        "--backbone",      type=str,   default=None, help="Override backbone arch."
-    )
-    parser.add_argument(
-        "--resume_checkpoint", type=str, default=None,
-        help="Path to an existing .pth checkpoint to resume from.",
-    )
-    return parser.parse_args()
+    return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    # Load base config
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    # CLI overrides (only if explicitly provided)
-    overrides = {
-        "dataset":           args.dataset,
-        "data_root":         args.data_root,
-        "save_dir":          args.save_dir,
-        "seed":              args.seed,
-        "num_classes":       args.num_classes,
-        "backbone":          args.backbone,
-        "resume_checkpoint": args.resume_checkpoint,
-    }
-    for key, val in overrides.items():
-        if val is not None:
-            cfg[key] = val
+    # Apply CLI overrides
+    if args.data_root:          cfg["data_root"] = args.data_root
+    if args.save_dir:           cfg["save_dir"] = args.save_dir
+    if args.seed is not None:   cfg["seed"] = args.seed
+    if args.resume_checkpoint:  cfg["resume_checkpoint"] = args.resume_checkpoint
+    if args.no_omega:           cfg["compute_omega_all"] = False
 
     print("\n[SLDA] Configuration:")
     print(json.dumps(cfg, indent=2))

@@ -1,45 +1,58 @@
-# Deep SLDA – Streaming Linear Discriminant Analysis
+# Deep SLDA – Faithful Paper Reproduction
 
-**Paper reproduced:** *Lifelong Machine Learning with Deep Streaming Linear Discriminant Analysis*  
+**Paper:** *Lifelong Machine Learning with Deep Streaming Linear Discriminant Analysis*  
 Tyler L. Hayes & Christopher Kanan  
 CVPR Workshops (CLVision), 2020  
 [📄 PDF](https://openaccess.thecvf.com/content_CVPRW_2020/papers/w15/Hayes_Lifelong_Machine_Learning_With_Deep_Streaming_Linear_Discriminant_Analysis_CVPRW_2020_paper.pdf) | [💻 Official code](https://github.com/tyler-hayes/Deep_SLDA)
 
 ---
 
-## Overview
+## Paper Overview
 
-**Deep SLDA** couples a *completely frozen* deep backbone with a streaming LDA classifier.  It is designed for the **class-incremental** (data stream) scenario where:
+Deep SLDA couples a **completely frozen ResNet-18** backbone with a streaming LDA classifier
+to enable class-incremental learning from a one-pass data stream, with no replay buffer.
 
-- Each sample is seen only **once** (no replay buffer).
-- No gradients are backpropagated through the backbone.
-- The classifier updates in **O(d²)** time per sample, where d is the feature dimension.
+### What the paper actually uses
 
-### Core Algorithm
+| Item | Paper |
+|------|-------|
+| **Dataset** | ImageNet-1000 (ILSVRC 2012). **Only dataset in the paper.** |
+| **Backbone** | ResNet-18. **Only architecture in the paper.** |
+| **Backbone init** | Offline training on **first 100 ImageNet classes** (shared by all methods). |
+| **Features** | From `layer4.1` of ResNet-18, spatially mean-pooled → 512-d. |
+| **Primary metric** | Ω_all = (1/T) Σ_t (α_t / α_offline,t) |
+| **Secondary metric** | Top-1 / Top-5 accuracy after each 100-class increment |
+| **Baselines** | Fine-tuning (θF), Fine-tuning (θF+θG), ExStream, iCaRL, End-to-End |
 
-The classifier maintains three sufficient statistics:
+---
 
-| Symbol | Shape | Description |
-|--------|-------|-------------|
-| `muK`  | (C, d) | Per-class mean vectors |
-| `cK`   | (C,)  | Per-class sample counts |
-| `Sigma`| (d, d) | Shared (tied) covariance matrix |
+## Algorithm
 
-**Streaming update** (one sample at a time):
+### Streaming update (one sample at a time)
 
 $$\delta = \frac{n}{n+1}(\mathbf{x} - \boldsymbol{\mu}_k)^\top(\mathbf{x} - \boldsymbol{\mu}_k)$$
 
-$$\boldsymbol{\Sigma} \leftarrow \frac{n \cdot \boldsymbol{\Sigma} + \delta}{n+1}$$
+$$\boldsymbol{\Sigma} \leftarrow \frac{n \cdot \boldsymbol{\Sigma} + \delta}{n+1}, \quad \boldsymbol{\mu}_k \leftarrow \boldsymbol{\mu}_k + \frac{\mathbf{x} - \boldsymbol{\mu}_k}{c_k + 1}$$
 
-$$\boldsymbol{\mu}_k \leftarrow \boldsymbol{\mu}_k + \frac{\mathbf{x} - \boldsymbol{\mu}_k}{c_k + 1}$$
+### Prediction (LDA discriminant rule)
 
-**Prediction** (LDA discriminant scores):
+$$\boldsymbol{\Lambda} = \bigl[(1-\varepsilon)\boldsymbol{\Sigma} + \varepsilon \mathbf{I}\bigr]^{-1}$$
 
-$$\boldsymbol{\Lambda} = \text{pinv}\bigl((1-\varepsilon)\boldsymbol{\Sigma} + \varepsilon \mathbf{I}\bigr)$$
+$$\hat{y} = \arg\max_k \;\bigl(\mathbf{x}^\top \boldsymbol{\Lambda} \boldsymbol{\mu}_k - \tfrac{1}{2}\boldsymbol{\mu}_k^\top \boldsymbol{\Lambda} \boldsymbol{\mu}_k\bigr)$$
 
-$$\hat{y} = \arg\max_k \;\bigl(\boldsymbol{\Lambda}\boldsymbol{\mu}_k^\top \mathbf{x} - \tfrac{1}{2}\boldsymbol{\mu}_k \boldsymbol{\Lambda}\boldsymbol{\mu}_k^\top\bigr)$$
+**Note on Λ computation:** The paper uses a regular matrix inverse `[...]^{-1}` (not pseudo-inverse),
+because `(1-ε)Σ + εI` is positive definite for any ε > 0. This implementation uses
+`torch.linalg.inv` accordingly.
 
-where ε = `shrinkage_param` (default 1e-4).
+### Primary Metric: Ω_all
+
+$$\Omega_{all} = \frac{1}{T} \sum_{t=1}^{T} \frac{\alpha_t}{\alpha_{offline,t}}$$
+
+- **α_t** — accuracy of the streaming SLDA model after t increments
+- **α_offline,t** — accuracy of an **offline LDA** trained on ALL data seen up to t (upper bound)
+- **T** — total increments (9 for ImageNet with base_classes=100, class_increment=100)
+
+This metric is computed by default (`compute_omega_all: true` in config).
 
 ---
 
@@ -47,171 +60,158 @@ where ε = `shrinkage_param` (default 1e-4).
 
 ```
 slda/
-├── model.py          # StreamingLDA class (core algorithm)
-├── train.py          # Training + evaluation script
-├── backbone.py       # Frozen feature extractors (ResNet, VGG)
-├── utils.py          # Datasets, metrics, transforms
-├── config.yaml       # Reproducible hyperparameter configuration
-├── requirements.txt  # Python dependencies
-└── run.sh            # Single-command execution script
+├── model.py        # StreamingLDA class (core algorithm)
+├── train.py        # Training + evaluation with Omega_all
+├── backbone.py     # ResNet-18 feature extractor (paper-faithful)
+├── utils.py        # ImageNet loader, metrics
+├── config.yaml     # Paper-faithful config (ImageNet, all hyperparameters)
+├── requirements.txt
+├── run.sh
+└── README.md
 ```
 
 ---
 
 ## Quick Start
 
-### 1. Install dependencies
+### 1. Get the data and checkpoint
+
+```bash
+# ImageNet-1000 must be manually downloaded from https://image-net.org/
+# After downloading, your data_root must look like:
+#   /path/to/imagenet/train/n01440764/...
+#   /path/to/imagenet/val/n01440764/...
+
+# The authors' backbone checkpoint (ResNet-18 trained on first 100 ImageNet classes):
+# Download from: https://github.com/tyler-hayes/Deep_SLDA
+# Place at: ./imagenet_files/imagenet_100_class_ckpt.pth
+```
+
+### 2. Set your data path
+
+Edit `config.yaml`:
+```yaml
+data_root: "/your/path/to/imagenet"
+backbone_checkpoint: "./imagenet_files/imagenet_100_class_ckpt.pth"
+```
+
+### 3. Run
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 2. Run (single command)
-
-```bash
 python train.py --config config.yaml
 ```
 
-Or using the shell script:
-
+Or:
 ```bash
-bash run.sh config.yaml
-```
-
-### 3. Custom dataset / overrides
-
-You can override any config key from the CLI:
-
-```bash
-python train.py --config config.yaml \
-    --dataset cifar100 \
-    --data_root ./data \
-    --save_dir ./results/my_run \
-    --seed 42
+bash run.sh
 ```
 
 ---
 
-## Configuration (`config.yaml`)
+## Configuration
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `dataset` | `cifar100` | Dataset: `cifar100`, `tiny-imagenet`, `imagenet` |
-| `data_root` | `./data` | Where data lives / is downloaded |
-| `num_classes` | `100` | Total classes in the stream |
-| `backbone` | `resnet18` | Backbone arch: `resnet18`, `resnet50`, `vgg16_bn`, … |
-| `feature_dim` | `512` | Feature dimension (must match backbone) |
-| `imagenet_pretrained` | `true` | Load ImageNet-pretrained backbone weights |
-| `backbone_checkpoint` | `null` | Custom backbone .pth path (overrides pretrained) |
-| `shrinkage_param` | `1e-4` | Tikhonov regularisation ε for precision matrix |
-| `streaming_update_sigma` | `true` | Update Σ online; `false` freezes it after base-init |
-| `base_classes` | `10` | Classes used in OAS-init (first increment) |
-| `class_increment` | `10` | Classes added per streaming increment |
-| `batch_size` | `256` | Feature extraction / evaluation batch size |
-| `test_batch_size` | `1024` | Internal predict() mini-batch size |
-| `shuffle_data` | `false` | Whether to shuffle training stream (paper: false) |
-| `seed` | `0` | Global random seed |
-| `save_dir` | `./results/slda_cifar100` | Output directory for checkpoints & JSON results |
-| `resume_checkpoint` | `null` | Path to a .pth file to resume from |
+| Key | Paper Value | Description |
+|-----|-------------|-------------|
+| `dataset` | `imagenet` | **Must be `imagenet` for paper reproduction** |
+| `data_root` | — | Path to ImageNet root (`train/` + `val/`) |
+| `num_classes` | `1000` | Total ImageNet classes |
+| `backbone` | `resnet18` | **ResNet-18 only in paper** |
+| `feature_dim` | `512` | ResNet-18 layer4.1 mean-pooled output |
+| `backbone_checkpoint` | authors' ckpt | ResNet-18 trained on first 100 classes |
+| `imagenet_pretrained` | `false` | Must be false when using checkpoint |
+| `shrinkage_param` | `1e-4` | ε in Λ = [(1-ε)Σ + εI]⁻¹ |
+| `streaming_update_sigma` | `true` | Online Σ update (main); `false` = ablation |
+| `base_classes` | `100` | Classes in OAS-init base increment |
+| `class_increment` | `100` | New classes per streaming increment |
+| `shuffle_data` | `false` | Class-ordered stream (no shuffling) |
+| `compute_omega_all` | `true` | Compute Ω_all (paper's primary metric) |
+| `seed` | `0` | Random seed |
 
 ---
 
-## ImageNet Experiment (paper's main result)
+## Expected Results (from paper Table 1)
 
-The paper runs SLDA on ImageNet-1K with a ResNet-18 backbone pre-trained on the first 100 classes.  To reproduce:
+| Method | Ω_all | Final Top-1 | Final Top-5 |
+|--------|-------|-------------|-------------|
+| Deep SLDA (streaming Σ) | ~0.95 | ~63.5% | ~83.4% |
+| Deep SLDA (fixed Σ)     | ~0.97 | ~65.0% | ~84.5% |
 
-```yaml
-# config.yaml (ImageNet)
-dataset: imagenet
-data_root: /path/to/imagenet
-num_classes: 1000
-backbone: resnet18
-feature_dim: 512
-imagenet_pretrained: false
-backbone_checkpoint: ./imagenet_files/imagenet_100_class_ckpt.pth
-base_classes: 100
-class_increment: 100
-save_dir: ./results/slda_imagenet
-```
-
-```bash
-python train.py --config config.yaml
-```
-
-**Expected results (from paper, Table 1):**
-
-| Method | Top-1 | Top-5 |
-|--------|-------|-------|
-| Deep SLDA (streaming Σ) | ~63.5% | ~83.4% |
-| Deep SLDA (fixed Σ)     | ~65.0% | ~84.5% |
+Results shown above require the authors' backbone checkpoint.
+Using a full ImageNet-pretrained ResNet-18 will give different numbers.
 
 ---
 
-## Checkpointing
+## Backbone Initialization Protocol
 
-The model is saved after each class-increment:
+The paper explicitly states: *"all models use the same offline base CNN initialization procedure."*
 
-```
-results/slda_cifar100/
-├── config.json
-├── accuracies.json
-├── slda_min0_max10.pth
-├── slda_min0_max20.pth
-├── ...
-└── slda_final.pth
-```
+This means:
+1. A ResNet-18 is trained **offline** (full data, full epochs) on the **first 100 ImageNet classes**.
+2. This trained network becomes the **frozen feature extractor** for ALL streaming experiments.
+3. The training data for these 100 classes is then re-used to initialize SLDA via `fit_base()`.
 
-**Resume from a checkpoint:**
+This implementation handles this via:
+- `backbone_checkpoint`: path to the offline-trained ResNet-18 (authors provide it).
+- `fit_base()`: OAS covariance estimation on all base-100-class features.
 
-```bash
-python train.py --config config.yaml \
-    --resume_checkpoint ./results/slda_cifar100/slda_min0_max50.pth
-```
+Without the authors' checkpoint, results will **not** match the paper.
 
-**Load in Python:**
+---
 
-```python
-from model import StreamingLDA
+## What Is and Is Not Implemented
 
-model = StreamingLDA.from_checkpoint(
-    save_path="./results/slda_cifar100",
-    save_name="slda_final",
-)
-```
+### Implemented (faithful to paper)
+
+| ✅ | Detail |
+|----|--------|
+| Streaming covariance update (Welford-style) | Exactly as in paper / official code |
+| Online class-mean update | Exact formula |
+| OAS base initialization | `sklearn.covariance.OAS(assume_centered=True)` |
+| Precision matrix via regular inverse | `torch.linalg.inv` — matches paper formula |
+| Layer4.1 extraction + spatial mean pool | Hook-based, matches `retrieve_any_layer.py` |
+| Omega_all metric | (1/T)Σ(α_t / α_offline_t), computed at each increment |
+| Offline LDA upper bound | Fresh OAS-LDA on all seen data at each t |
+| Checkpoint save/load | Sufficient statistics + hyperparameters |
+| Deterministic seeds | torch, numpy, random, cuDNN |
+| Class-ordered stream | shuffle_data=false |
+
+### Not Implemented
+
+| ❌ | Reason |
+|----|--------|
+| **Comparison baselines** (iCaRL, ExStream, Fine-tuning, End-to-End) | Separate methods; outside the scope of this SLDA reproduction. Each would require its own implementation. |
+| **Per-class covariance** | Paper mentions it briefly but uses tied Σ as main contribution |
+| **Online training of backbone** | Paper explicitly uses frozen backbone; this is intentional |
+| **Multiple datasets** | Paper uses **only ImageNet**. CIFAR-100/Tiny-ImageNet in the extension config are provided for development convenience only — they will NOT reproduce any paper number. |
 
 ---
 
 ## Assumptions
 
-1. **Frozen backbone**: The backbone is always fully frozen. No gradient updates to the feature extractor are performed (faithful to the paper).
-2. **Tied covariance**: A single shared Σ is used across all classes (LDA assumption). The paper also ablates class-specific covariance (not implemented here).
-3. **OAS for base init**: The first increment uses Oracle Approximating Shrinkage (OAS) from scikit-learn for better-conditioned Σ initialisation, matching the paper's `fit_base`.
-4. **Class-ordered stream**: Data arrives in class-ordered batches (`shuffle_data: false`). The streaming equations are derived for this protocol.
-5. **`fit` called once per sample**: The inner loop in `fit_batch` calls `fit(xi, yi)` for each sample individually, as done in the official code.
+1. **Frozen backbone throughout**: No gradient updates to ResNet-18 at any point.
+2. **Tied covariance**: One shared Σ across all classes (standard LDA assumption).
+3. **Class-ordered stream**: Data arrives class by class (not shuffled), matching the paper.
+4. **One sample at a time**: `fit()` is called individually for each streaming sample.
+5. **OAS for base**: `sklearn OAS(assume_centered=True)` as used in official `fit_base()`.
+6. **Offline upper bound**: α_offline,t is an OAS-LDA re-fit from scratch on all seen features.
 
 ---
 
-## Unsupported Features
+## Expected Runtime (ImageNet, RTX 3090)
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Per-class covariance | ❌ Not implemented | Paper mentions it briefly; tied Σ is the main contribution |
-| Task boundaries required | ❌ Not required | SLDA is task-agnostic; labels are always observed at train time |
-| Data augmentation at test time | ❌ Not implemented | Paper doesn't use TTA |
-| Distributed training | ❌ Not applicable | SLDA has no backprop, distributed training isn't relevant |
-| Multi-GPU feature extraction | ⚠️ Untested | Single-GPU feature extraction is assumed |
+| Phase | Time |
+|-------|------|
+| Pre-extracting all features (for Ω_all) | ~20 min |
+| Base init (100 classes, OAS) | ~2 min |
+| Each streaming increment (100 classes) | ~5 min feature extraction |
+| Offline LDA upper bound per increment | ~2 min |
+| **Total** | **~90–120 min** |
 
----
-
-## Expected Runtime
-
-| Dataset | GPU | Backbone | Expected Time |
-|---------|-----|----------|---------------|
-| CIFAR-100 | RTX 3090 | ResNet-18 (pretrained) | ~3–5 min |
-| Tiny-ImageNet | RTX 3090 | ResNet-18 (pretrained) | ~10–15 min |
-| ImageNet-1K | RTX 3090 | ResNet-18 (custom ckpt) | ~60–90 min |
-
-SLDA training time is dominated by feature extraction (forward pass through the frozen backbone), not the LDA updates themselves.
+Skip Ω_all computation (faster, no offline upper bound):
+```bash
+python train.py --config config.yaml --no_omega
+```
 
 ---
 

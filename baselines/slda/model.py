@@ -10,36 +10,34 @@ Faithful implementation of:
     Paper: https://openaccess.thecvf.com/content_CVPRW_2020/papers/w15/
            Hayes_Lifelong_Machine_Learning_With_Deep_Streaming_Linear_Discriminant_Analysis_CVPRW_2020_paper.pdf
 
-Algorithm Summary
------------------
-Deep SLDA couples a *frozen* deep feature extractor with a streaming LDA
-classifier.  The classifier maintains:
+Dataset in paper: ImageNet-1000 (ILSVRC 2012). Only dataset used in all paper experiments.
 
-  * muK  (C × d) – per-class mean vectors
-  * cK   (C,)    – per-class sample counts
-  * Sigma (d × d)– shared (tied) covariance matrix (updated online or fixed)
+Algorithm
+---------
+The classifier maintains three sufficient statistics:
 
-Given a new sample (x, y):
+  muK  (C x d)  -- per-class feature mean vectors
+  cK   (C,)     -- per-class sample counts
+  Sigma (d x d) -- shared (tied) covariance matrix; updated online or frozen
 
-  Covariance update (streaming):
-      delta  = (x - muK[y])^T (x - muK[y]) * n / (n + 1)
-      Sigma  = (n * Sigma + delta) / (n + 1)
+Streaming update for one sample (x, y):
+    # covariance (Welford-style, paper Eq.):
+    delta  = (x - muK[y])^T (x - muK[y]) * n / (n + 1)
+    Sigma  = (n * Sigma + delta) / (n + 1)
+    # class mean (online mean formula):
+    muK[y] += (x - muK[y]) / (cK[y] + 1)
+    cK[y]  += 1
 
-  Mean update:
-      muK[y] += (x - muK[y]) / (cK[y] + 1)
-      cK[y]  += 1
+Prediction (LDA discriminant rule, paper Section 3):
+    Lambda = [(1 - eps) * Sigma + eps * I]^{-1}   # NOT pseudo-inverse; paper uses exact inverse
+    W      = Lambda @ muK.T                         # (d, C)
+    c      = 0.5 * diag(muK @ W)                   # bias  (C,)
+    score(x) = x @ W - c                           # (N, C)
 
-Prediction (LDA discriminant scores):
-      Lambda = pinv((1 - eps) * Sigma + eps * I)    # precision matrix
-      W      = Lambda @ muK.T                        # (d × C)
-      c      = 0.5 * diag(muK @ W)                  # bias terms  (C,)
-      score(x) = x @ W - c                          # (N × C)
-      y_hat  = argmax(score(x), dim=1)
-
-Base Initialization:
-  When sufficient data are available at startup, the covariance is estimated
-  via Oracle Approximating Shrinkage (OAS) from sklearn, which is more
-  accurate than the streaming one-pass estimator on large batches.
+Base initialization (first increment only):
+    Class means: exact mean over base batch per class.
+    Sigma: Oracle Approximating Shrinkage (OAS) from sklearn on mean-centred features.
+    This matches the paper's "offline base CNN initialization procedure."
 """
 
 import os
@@ -51,29 +49,24 @@ class StreamingLDA(nn.Module):
     """
     Streaming Linear Discriminant Analysis classifier.
 
-    This module is NOT a PyTorch neural network in the conventional sense –
-    it does not use backprop.  Inheriting from nn.Module lets us use
-    ``save_model`` / ``load_model`` seamlessly alongside PyTorch checkpoints.
-
     Parameters
     ----------
     feature_dim : int
-        Dimensionality d of the input feature vectors.
+        Dimensionality d of input feature vectors.
+        Paper uses 512 (ResNet-18 global average pooling output).
     num_classes : int
-        Total number of output classes C (must be known in advance).
+        Total classes C known in advance.
+        Paper: 1000 (ImageNet).
     shrinkage_param : float
-        Tikhonov/shrinkage regularisation ε used when computing the
-        precision matrix Lambda = pinv((1-ε)Σ + εI).
+        Regularisation epsilon in Lambda = [(1-eps)*Sigma + eps*I]^{-1}.
         Paper default: 1e-4.
     streaming_update_sigma : bool
-        If True, Σ is updated online (one sample at a time) after the
-        base-init phase.  If False, Σ is frozen after base-init.
-        Paper ablation: both variants are studied; streaming is default.
+        True  -> update Sigma online one sample at a time (main paper result).
+        False -> freeze Sigma after OAS base-init (ablation in paper Table 2).
     test_batch_size : int
-        Mini-batch size used internally during inference to avoid OOM on
-        large test sets.
-    device : str | None
-        'cuda', 'cpu', or None (auto-detect).
+        Mini-batch size for predict() to avoid GPU OOM on large test sets.
+    device : str or None
+        Compute device. Auto-detected if None.
     """
 
     def __init__(
@@ -97,72 +90,66 @@ class StreamingLDA(nn.Module):
         self.streaming_update_sigma = streaming_update_sigma
         self.test_batch_size = test_batch_size
 
-        # ------------------------------------------------------------------ #
-        # Sufficient statistics maintained by the classifier
-        # ------------------------------------------------------------------ #
-        # muK  : per-class mean vectors           shape (C, d)
-        # cK   : per-class sample counts          shape (C,)
-        # Sigma: shared tied covariance matrix    shape (d, d)
-        # ------------------------------------------------------------------ #
+        # ------------------------------------------------------------------
+        # Sufficient statistics
+        # ------------------------------------------------------------------
+        # muK  : per-class mean vectors  (C, d)
+        # cK   : per-class counts         (C,)
+        # Sigma: shared covariance matrix (d, d)
+        # Lambda: cached precision matrix (d, d) -- recomputed lazily
+        # ------------------------------------------------------------------
         self.muK = torch.zeros(num_classes, feature_dim, device=device)
         self.cK = torch.zeros(num_classes, device=device)
-        # Initialised to identity (Sigma = I) so the first predictions are
-        # reasonable before any covariance estimate is available.
+        # Init to identity so predictions are valid before first update
         self.Sigma = torch.eye(feature_dim, device=device)
-        self.num_updates = 0  # total samples seen (across all classes)
+        self.num_updates = 0
 
-        # Cache the precision matrix so we only recompute it when Sigma changes
+        # Precision matrix cache -- recomputed only when Sigma changes
         self.Lambda = torch.zeros(feature_dim, feature_dim, device=device)
         self._prev_num_updates = -1  # sentinel for cache invalidation
 
-    # ---------------------------------------------------------------------- #
-    # Training methods
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def fit(self, x: torch.Tensor, y: torch.Tensor) -> None:
         """
-        Update the classifier with a *single* new (feature, label) pair.
+        Update the classifier with a single new (feature, label) pair.
 
-        This is the core streaming update.  Call this once per sample in
-        the order they arrive from the stream.
+        This implements the paper's streaming update equations exactly.
+        Call once per sample in arrival order.
 
         Parameters
         ----------
-        x : Tensor of shape (d,) or (1, d)
-            Feature vector extracted from the frozen backbone.
-        y : Tensor scalar or shape (1,)
-            Integer class label.
+        x : Tensor shape (d,) or (1, d)
+        y : scalar Tensor or shape (1,)
         """
         x = x.to(self.device, dtype=torch.float32)
         y = y.long().to(self.device)
 
-        # Ensure correct shapes
         if x.dim() < 2:
-            x = x.unsqueeze(0)          # (1, d)
+            x = x.unsqueeze(0)   # (1, d)
         if y.dim() == 0:
-            y = y.unsqueeze(0)          # (1,)
+            y = y.unsqueeze(0)   # (1,)
 
-        # ------------------------------------------------------------------ #
-        # Streaming covariance update (Eq. 2 in paper / Welford-style)
-        #
-        #   delta = (x - mu_k)^T (x - mu_k) * n / (n + 1)
-        #   Sigma = (n * Sigma + delta) / (n + 1)
-        #
-        # where n = self.num_updates (total updates so far)
-        # ------------------------------------------------------------------ #
+        # ------------------------------------------------------------------
+        # Streaming covariance update (Welford-style one-pass estimator)
+        # Paper: delta = (x - mu_k)^T (x - mu_k) * n / (n+1)
+        #        Sigma = (n * Sigma + delta) / (n+1)
+        # NOTE: update uses OLD muK[y] (before mean update below).
+        # ------------------------------------------------------------------
         if self.streaming_update_sigma:
-            x_minus_mu = x - self.muK[y]                   # (1, d)
-            mult = x_minus_mu.t().mm(x_minus_mu)           # (d, d)
+            x_minus_mu = x - self.muK[y]               # (1, d)
+            mult = x_minus_mu.t().mm(x_minus_mu)        # (d, d)
             n = self.num_updates
             delta = mult * n / (n + 1)
             self.Sigma = (n * self.Sigma + delta) / (n + 1)
 
-        # ------------------------------------------------------------------ #
+        # ------------------------------------------------------------------
         # Class-mean update (online mean formula)
-        #
-        #   muK[y] += (x - muK[y]) / (cK[y] + 1)
-        # ------------------------------------------------------------------ #
+        # muK[y] += (x - muK[y]) / (cK[y] + 1)
+        # ------------------------------------------------------------------
         self.muK[y, :] += (x - self.muK[y, :]) / (self.cK[y] + 1).unsqueeze(1)
         self.cK[y] += 1
         self.num_updates += 1
@@ -170,15 +157,16 @@ class StreamingLDA(nn.Module):
     @torch.no_grad()
     def fit_batch(self, X: torch.Tensor, y: torch.Tensor) -> None:
         """
-        Update the classifier one sample at a time over a batch.
+        Stream a batch of (feature, label) pairs one sample at a time.
 
-        Convenience wrapper – identical to calling ``fit`` in a loop.
-        Used during the incremental (non-base) streaming phase.
+        Identical to calling fit() in a loop -- this is the correct protocol.
+        The paper fits one sample at a time; batching is NOT done in the SLDA
+        update itself.
 
         Parameters
         ----------
-        X : Tensor of shape (N, d)
-        y : Tensor of shape (N,) or (N, 1)
+        X : Tensor (N, d)
+        y : Tensor (N,) or (N, 1)
         """
         X = X.to(self.device, dtype=torch.float32)
         y = y.view(-1).long().to(self.device)
@@ -188,119 +176,104 @@ class StreamingLDA(nn.Module):
     @torch.no_grad()
     def fit_base(self, X: torch.Tensor, y: torch.Tensor) -> None:
         """
-        Initialise the classifier from a batch of base-class data.
+        Base-class initialisation using the full base batch (first increment only).
 
-        This replaces the streaming estimator for the first (base) increment:
-          * Class means are computed exactly from the full base batch.
-          * Σ is estimated using Oracle Approximating Shrinkage (OAS) from
-            sklearn, which gives a better-conditioned estimate than Welford
-            on a moderate-sized batch.
+        This matches the paper's "offline base CNN initialization procedure":
+          - Class means computed exactly from the full base batch.
+          - Sigma estimated via Oracle Approximating Shrinkage (OAS) from sklearn
+            on the mean-centred features of all base samples.
 
         Parameters
         ----------
-        X : Tensor of shape (N, d)
-            All feature vectors for the base classes.
-        y : Tensor of shape (N,) or (N, 1)
-            Corresponding integer labels.
+        X : Tensor (N, d)  -- all features for base classes
+        y : Tensor (N,)    -- corresponding integer labels
         """
         X = X.to(self.device, dtype=torch.float32)
         y = y.squeeze().long().to(self.device)
 
-        print("[SLDA] Fitting base initialisation ...")
-
-        # Exact class-mean computation
+        print("[SLDA] fit_base: computing exact class means ...")
         for k in torch.unique(y):
             mask = y == k
             self.muK[k] = X[mask].mean(dim=0)
             self.cK[k] = mask.sum().float()
-
         self.num_updates = X.shape[0]
 
-        # OAS covariance estimation on mean-centred features
-        print("[SLDA] Estimating initial covariance matrix via OAS ...")
+        print("[SLDA] fit_base: estimating covariance via OAS ...")
         from sklearn.covariance import OAS
-
         X_centered = (X - self.muK[y]).cpu().numpy()
         oas = OAS(assume_centered=True)
         oas.fit(X_centered)
-        self.Sigma = (
-            torch.from_numpy(oas.covariance_).float().to(self.device)
-        )
-        print("[SLDA] Base init complete.")
+        self.Sigma = torch.from_numpy(oas.covariance_).float().to(self.device)
+        print("[SLDA] fit_base: done.")
 
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------
     # Inference
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def predict(
         self, X: torch.Tensor, return_probas: bool = False
     ) -> torch.Tensor:
         """
-        Compute LDA discriminant scores (or softmax probabilities).
+        LDA discriminant scores (or softmax probabilities).
 
-        LDA decision rule:
-            Lambda = pinv((1 - eps) * Sigma + eps * I)
-            W      = Lambda @ muK.T               (d × C)
-            c      = 0.5 * diag(muK @ W)          bias (C,)
-            score  = X @ W - c                    (N × C)
+        Paper formula (Section 3):
+            Lambda = [(1 - eps) * Sigma + eps * I]^{-1}
+            W      = Lambda @ muK.T                  (d, C)
+            c      = 0.5 * diag(muK @ W)             (C,)
+            score  = X @ W - c                       (N, C)
+
+        NOTE: We use torch.linalg.inv (exact inverse) because
+        (1-eps)*Sigma + eps*I is positive definite by construction (eps > 0),
+        so a pseudo-inverse (pinv) is unnecessary and not what the paper does.
 
         Parameters
         ----------
-        X : Tensor of shape (N, d)
-        return_probas : bool
-            If True, return softmax(scores) instead of raw scores.
+        X            : Tensor (N, d)
+        return_probas: bool -- if True return softmax(scores) else raw scores
 
         Returns
         -------
-        Tensor of shape (N, C) on CPU.
+        Tensor (N, C) on CPU.
         """
         X = X.to(self.device, dtype=torch.float32)
         num_samples = X.shape[0]
 
-        # Recompute precision matrix only when model has been updated
+        # Recompute Lambda only when Sigma has changed
         if self._prev_num_updates != self.num_updates:
-            print("\n[SLDA] Model updated - recomputing Lambda (precision matrix)...")
+            print("[SLDA] Recomputing precision matrix Lambda ...")
             eps = self.shrinkage_param
             reg_sigma = (1.0 - eps) * self.Sigma + eps * torch.eye(
                 self.feature_dim, device=self.device
             )
-            self.Lambda = torch.linalg.pinv(reg_sigma)
+            # Paper: Lambda = [(1-eps)*Sigma + eps*I]^{-1}  (exact inverse)
+            self.Lambda = torch.linalg.inv(reg_sigma)
             self._prev_num_updates = self.num_updates
 
-        # Precompute shared weight matrix and bias
-        M = self.muK.t()                                    # (d, C)
-        W = self.Lambda @ M                                 # (d, C)
-        c = 0.5 * (M * W).sum(dim=0)                       # (C,)
+        # Shared weight matrix and bias
+        M = self.muK.t()             # (d, C)
+        W = self.Lambda @ M          # (d, C)
+        c = 0.5 * (M * W).sum(dim=0) # (C,)
 
-        # Inference in mini-batches to avoid OOM
+        # Mini-batch inference to avoid OOM
         mb = min(self.test_batch_size, num_samples)
         scores = torch.empty(num_samples, self.num_classes, device="cpu")
-
         for start in range(0, num_samples, mb):
             end = min(start + mb, num_samples)
-            x_mb = X[start:end]                             # (≤mb, d)
-            scores[start:end] = (x_mb @ W - c).cpu()       # (≤mb, C)
+            scores[start:end] = (X[start:end] @ W - c).cpu()
 
         if return_probas:
             return torch.softmax(scores, dim=1)
         return scores
 
-    # ---------------------------------------------------------------------- #
-    # Checkpoint helpers
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------
+    # Checkpoint save / load
+    # ------------------------------------------------------------------
 
     def save_model(self, save_path: str, save_name: str) -> None:
         """
-        Persist the SLDA sufficient statistics to disk.
-
-        Saves: muK, cK, Sigma, num_updates, feature_dim, num_classes,
-               shrinkage_param, streaming_update_sigma.
-
-        Parameters
-        ----------
-        save_path : str   directory where the file will be written
-        save_name : str   filename (without extension)
+        Persist sufficient statistics + hyperparameters to a .pth file.
+        Saves: muK, cK, Sigma, num_updates + all constructor hyperparameters.
         """
         os.makedirs(save_path, exist_ok=True)
         ckpt = {
@@ -308,7 +281,7 @@ class StreamingLDA(nn.Module):
             "cK": self.cK.cpu(),
             "Sigma": self.Sigma.cpu(),
             "num_updates": self.num_updates,
-            # Hyperparameters needed to reconstruct the model
+            # Hyperparameters needed to reconstruct
             "feature_dim": self.feature_dim,
             "num_classes": self.num_classes,
             "shrinkage_param": self.shrinkage_param,
@@ -316,45 +289,28 @@ class StreamingLDA(nn.Module):
         }
         path = os.path.join(save_path, save_name + ".pth")
         torch.save(ckpt, path)
-        print(f"[SLDA] Checkpoint saved -> {path}")
+        print(f"[SLDA] Checkpoint saved: {path}")
 
     def load_model(self, save_path: str, save_name: str) -> None:
         """
-        Load SLDA sufficient statistics from a checkpoint.
-
-        Parameters
-        ----------
-        save_path : str   directory containing the checkpoint
-        save_name : str   filename (without extension)
+        Load sufficient statistics from a .pth checkpoint into this instance.
         """
         path = os.path.join(save_path, save_name + ".pth")
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.muK = ckpt["muK"].to(self.device)
         self.cK = ckpt["cK"].to(self.device)
         self.Sigma = ckpt["Sigma"].to(self.device)
         self.num_updates = ckpt["num_updates"]
-        # Reset precision cache so it is recomputed on next predict()
-        self._prev_num_updates = -1
-        print(f"[SLDA] Checkpoint loaded <- {path}")
+        self._prev_num_updates = -1  # force Lambda recompute on next predict
+        print(f"[SLDA] Checkpoint loaded: {path}")
 
     @classmethod
     def from_checkpoint(cls, save_path: str, save_name: str, device: str = None):
         """
-        Construct a StreamingLDA instance directly from a checkpoint.
-
-        Parameters
-        ----------
-        save_path, save_name : str
-            As in ``load_model``.
-        device : str | None
-            Target device; auto-detected if None.
-
-        Returns
-        -------
-        StreamingLDA
+        Construct a StreamingLDA directly from a checkpoint file.
         """
         path = os.path.join(save_path, save_name + ".pth")
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         instance = cls(
             feature_dim=ckpt["feature_dim"],
             num_classes=ckpt["num_classes"],
@@ -365,16 +321,11 @@ class StreamingLDA(nn.Module):
         instance.load_model(save_path, save_name)
         return instance
 
-    # ---------------------------------------------------------------------- #
-    # Utility
-    # ---------------------------------------------------------------------- #
-
     def __repr__(self) -> str:
         return (
-            f"StreamingLDA("
-            f"feature_dim={self.feature_dim}, "
+            f"StreamingLDA(feature_dim={self.feature_dim}, "
             f"num_classes={self.num_classes}, "
-            f"shrinkage={self.shrinkage_param}, "
+            f"eps={self.shrinkage_param}, "
             f"streaming_sigma={self.streaming_update_sigma}, "
             f"num_updates={self.num_updates})"
         )

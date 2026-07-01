@@ -1,10 +1,10 @@
 # =============================================================================
-#  Deep SLDA – Configuration (CIFAR-100, default)
+#  Deep SLDA – Configuration (ImageNet-1000, paper-faithful)
 # =============================================================================
+#  Paper:  Hayes & Kanan, "Lifelong Machine Learning with Deep Streaming
+#          Linear Discriminant Analysis", CVPR Workshops 2020.
 #
-#  Paper:  Hayes & Kanan, CVPRW 2020
-#  Title:  Lifelong Machine Learning with Deep Streaming Linear Discriminant
-#          Analysis
+#  Dataset: ImageNet-1000 (ILSVRC 2012). THE ONLY DATASET USED IN THE PAPER.
 #
 #  Run with:
 #      python train.py --config config.yaml
@@ -12,54 +12,86 @@
 # =============================================================================
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
-dataset: "cifar100"       # Options: cifar100 | tiny-imagenet | imagenet
-data_root: "./data"       # Where to download / find the dataset
-num_classes: 100          # Total classes in the dataset (CIFAR-100 = 100)
+# Paper: ImageNet-1000 ONLY.  Do not change this for paper reproduction.
+dataset: "imagenet"
+data_root: "/path/to/imagenet"    # <<< SET THIS: must contain train/ and val/
+num_classes: 1000                 # ImageNet has 1000 classes
 
-# ── Backbone (frozen feature extractor) ──────────────────────────────────────
-# Paper uses ResNet-18.  The backbone is completely frozen during SLDA training.
-backbone: "resnet18"          # Options: resnet18 | resnet34 | resnet50 | resnet101 | vgg16_bn
-feature_dim: 512              # Output dimension of the backbone (resnet18 → 512)
-imagenet_pretrained: true     # Use ImageNet-pretrained ResNet-18 weights
-backbone_checkpoint: null     # Path to a custom .pth backbone checkpoint (optional)
-                              # If set, imagenet_pretrained is ignored.
-feature_layer: "avgpool"      # Feature extraction point (kept for API compat)
+# ── Backbone (frozen ResNet-18 -- the ONLY backbone in the paper) ─────────────
+# Paper Section 4: "all models use the same offline base CNN initialization"
+# The backbone is ResNet-18 trained OFFLINE on the first 100 ImageNet classes.
+# Download the authors' checkpoint:
+#   https://github.com/tyler-hayes/Deep_SLDA
+#   file: imagenet_files/imagenet_100_class_ckpt.pth
+backbone: "resnet18"
+feature_dim: 512                  # ResNet-18 layer4.1 spatial-mean-pooled output
+imagenet_pretrained: false        # Must be false when using backbone_checkpoint
+backbone_checkpoint: "./imagenet_files/imagenet_100_class_ckpt.pth"
+                                  # <<< Authors' checkpoint. Required for exact results.
+                                  # If null, a full ImageNet-pretrained ResNet-18
+                                  # is used (will NOT reproduce paper numbers).
 
 # ── SLDA Hyperparameters ─────────────────────────────────────────────────────
-# All values match Table 1 / Section 4 of the paper.
-shrinkage_param: 1.0e-4       # ε for precision matrix regularisation (paper default)
-streaming_update_sigma: true  # True: online Σ updates; False: freeze Σ after base-init
-                              # Paper ablates both; streaming=True is their main result.
+# Paper Table 1 / Section 3 defaults.
+shrinkage_param: 1.0e-4           # epsilon: regularises Lambda = [(1-eps)*Sigma + eps*I]^{-1}
+streaming_update_sigma: true      # True: online Sigma updates (paper main result)
+                                  # False: freeze Sigma after base-init (paper ablation)
 
-# ── Class-Incremental Protocol ───────────────────────────────────────────────
-base_classes: 10              # Classes used in the OAS-init base phase (first increment)
-class_increment: 10           # Number of new classes revealed per streaming increment
-                              # Paper uses 100-class increments on ImageNet (1000 classes)
-                              # For CIFAR-100 with 10-class increments, set to 10.
+# ── Class-Incremental Protocol (paper Section 4) ─────────────────────────────
+# Paper: base_classes=100, class_increment=100 => 1 base + 9 streaming increments
+base_classes: 100                 # First 100 classes: OAS covariance initialisation
+class_increment: 100              # New classes per streaming increment (paper: 100)
+                                  # Increments: 0-99 (base) | 100-199 | ... | 900-999
 
-# ── Training / Evaluation ────────────────────────────────────────────────────
-batch_size: 256               # Batch size for feature extraction & evaluation
-test_batch_size: 1024         # Internal mini-batch size for predict() (memory limit)
-shuffle_data: false           # Paper: False (class-ordered stream, no shuffling)
-num_workers: 4                # DataLoader workers
+# ── Evaluation ───────────────────────────────────────────────────────────────
+batch_size: 256                   # Feature extraction + evaluation batch size
+test_batch_size: 1024             # Internal predict() mini-batch size
+shuffle_data: false               # Paper: data arrives in class-ordered stream
+
+# Omega_all: PRIMARY metric from paper (Table 1).
+# Omega_all = (1/T) * sum_t (alpha_t / alpha_offline_t)
+# alpha_offline_t is computed by fitting a fresh OAS-LDA on all data seen at t.
+# Setting to false skips the offline upper bound and only reports accuracy.
+compute_omega_all: true
 
 # ── Reproducibility ──────────────────────────────────────────────────────────
-seed: 0                       # Random seed (torch, numpy, random)
+seed: 0                           # Random seed (torch, numpy, random, cuDNN)
+
+# ── Runtime ──────────────────────────────────────────────────────────────────
+num_workers: 8                    # DataLoader workers (match your CPU cores)
 
 # ── Checkpointing ────────────────────────────────────────────────────────────
-save_dir: "./results/slda_cifar100"   # Directory where checkpoints & results are saved
-resume_checkpoint: null               # Set to a .pth path to resume (e.g. for eval only)
+save_dir: "./results/slda_imagenet"
+resume_checkpoint: null           # Path to .pth to resume (e.g. after interruption)
 
 # =============================================================================
-#  ImageNet config example (uncomment and adjust)
+#  Paper expected results (Table 1):
+#
+#    Method                           Omega_all   Final Top-1   Final Top-5
+#    SLDA (streaming Sigma=True)       ~0.95       ~63.5%        ~83.4%
+#    SLDA (streaming Sigma=False)      ~0.97       ~65.0%        ~84.5%
+#
+#  Comparison baselines (NOT implemented here -- see README):
+#    Fine-tuning (theta_F)
+#    Fine-tuning (theta_F + theta_G)
+#    ExStream
+#    iCaRL
+#    End-to-End
 # =============================================================================
-# dataset: "imagenet"
-# data_root: "/path/to/imagenet"
-# num_classes: 1000
+
+# =============================================================================
+#  EXTENSION: non-paper dataset (results will NOT match paper)
+# =============================================================================
+# If you want to run on a smaller dataset for development/debugging, uncomment:
+#
+# dataset: "cifar100"         # NOT in paper
+# data_root: "./data"
+# num_classes: 100
 # backbone: "resnet18"
 # feature_dim: 512
-# imagenet_pretrained: false
-# backbone_checkpoint: "./imagenet_files/imagenet_100_class_ckpt.pth"
-# base_classes: 100
-# class_increment: 100
-# save_dir: "./results/slda_imagenet"
+# imagenet_pretrained: true   # Use full ImageNet pretrained (not paper protocol)
+# backbone_checkpoint: null
+# base_classes: 10
+# class_increment: 10
+# save_dir: "./results/slda_cifar100_extension"
+# compute_omega_all: false    # Omega_all not meaningful outside paper's ImageNet setup

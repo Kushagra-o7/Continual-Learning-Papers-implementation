@@ -1,26 +1,31 @@
 """
 Deep SLDA – Utilities
 ======================
-Dataset loaders, metrics, and helper classes shared across the codebase.
+Dataset loaders and metrics faithful to the paper.
+
+Paper dataset: ImageNet-1000 (ILSVRC 2012).
+Transforms:   Standard ImageNet normalization (mean/std from torchvision).
+              Paper uses resize-256 + center-crop-224 for val,
+              random-resized-crop-224 + horizontal-flip for train.
+
+The official code (utils.py) uses exactly these transforms.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Callable
 
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 
-# --------------------------------------------------------------------------- #
-# Metrics
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Metrics (matching the official utils.py accuracy function)
+# ---------------------------------------------------------------------------
 
 class AverageMeter:
-    """Computes and stores the running average of a scalar."""
+    """Running mean of a scalar quantity."""
 
     def __init__(self) -> None:
         self.reset()
@@ -33,34 +38,36 @@ class AverageMeter:
     def update(self, val: float, n: int = 1) -> None:
         self.sum += val * n
         self.count += n
-        self.avg = self.sum / self.count
+        self.avg = self.sum / self.count if self.count > 0 else 0.0
 
 
 def accuracy(
     output: torch.Tensor,
     target: torch.Tensor,
-    topk: tuple[int, ...] = (1,),
-) -> list[torch.Tensor]:
+    topk: tuple = (1,),
+) -> list:
     """
-    Compute top-k classification accuracy.
+    Compute top-k accuracy.
+
+    Matches the official utils.py accuracy() function exactly.
 
     Parameters
     ----------
-    output : Tensor (N, C)   – raw scores or probabilities
-    target : Tensor (N,)     – ground-truth integer labels
-    topk   : tuple of ints   – which k values to compute
+    output : Tensor (N, C)   raw scores or probabilities
+    target : Tensor (N,)     ground-truth integer labels
+    topk   : tuple           which k values to compute
 
     Returns
     -------
-    List of scalar tensors, one per k, each a percentage in [0, 100].
+    list of scalar Tensors, one per k, each a percentage in [0, 100].
     """
     with torch.no_grad():
         maxk = max(topk)
         batch_size = target.size(0)
 
-        _, pred = output.topk(maxk, dim=1, largest=True, sorted=True)  # (N, maxk)
-        pred = pred.t()                                                  # (maxk, N)
-        correct = pred.eq(target.view(1, -1).expand_as(pred))           # (maxk, N)
+        _, pred = output.topk(maxk, dim=1, largest=True, sorted=True)
+        pred = pred.t()                                       # (maxk, N)
+        correct = pred.eq(target.view(1, -1).expand_as(pred)) # (maxk, N)
 
         res = []
         for k in topk:
@@ -69,242 +76,171 @@ def accuracy(
         return res
 
 
-# --------------------------------------------------------------------------- #
-# Transforms
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# ImageNet data loader (paper's ONLY dataset)
+# ---------------------------------------------------------------------------
 
-def get_transforms(
-    dataset: str,
-    training: bool,
-    image_size: int = 224,
-) -> transforms.Compose:
+# Standard ImageNet normalization used by the paper's ResNet-18 backbone
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+def _imagenet_train_transform() -> transforms.Compose:
     """
-    Return standard torchvision transforms appropriate for each dataset.
-
-    Paper uses ImageNet normalisation for all experiments with a ResNet
-    backbone pre-trained on ImageNet.
+    Training transforms from the paper's official code.
+    Matches torchvision ImageNet training convention.
     """
-    mean = [0.485, 0.456, 0.406]
-    std  = [0.229, 0.224, 0.225]
-
-    dataset = dataset.lower()
-
-    if dataset == "imagenet":
-        if training:
-            return transforms.Compose([
-                transforms.RandomResizedCrop(image_size),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
-        else:
-            return transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(image_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
-
-    elif dataset in ("cifar100", "cifar-100"):
-        if training:
-            return transforms.Compose([
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.Resize(image_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
-        else:
-            return transforms.Compose([
-                transforms.Resize(image_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
-
-    elif dataset in ("tiny-imagenet", "tiny_imagenet"):
-        if training:
-            return transforms.Compose([
-                transforms.RandomHorizontalFlip(),
-                transforms.Resize(image_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
-        else:
-            return transforms.Compose([
-                transforms.Resize(image_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
-
-    else:
-        # Generic fallback
-        if training:
-            return transforms.Compose([
-                transforms.RandomResizedCrop(image_size),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
-        else:
-            return transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(image_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
+    return transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+    ])
 
 
-# --------------------------------------------------------------------------- #
-# Tiny-ImageNet helper
-# --------------------------------------------------------------------------- #
-
-class TinyImageNet(Dataset):
+def _imagenet_val_transform() -> transforms.Compose:
     """
-    Tiny-ImageNet (200 classes, 64×64 images).
-
-    Expected directory layout (after the official download):
-        <root>/
-            train/<class_id>/images/*.JPEG
-            val/images/*.JPEG
-            val/val_annotations.txt
-            wnids.txt
+    Validation transforms from the paper's official code.
+    Resize to 256, center crop to 224.
     """
-
-    def __init__(
-        self,
-        root: str,
-        train: bool = True,
-        transform: Callable | None = None,
-    ) -> None:
-        self.root = root
-        self.train = train
-        self.transform = transform
-        self.samples: list[tuple[str, int]] = []
-        self.targets: list[int] = []
-
-        # Build class-name → int mapping from wnids.txt
-        wnids_path = os.path.join(root, "wnids.txt")
-        with open(wnids_path) as f:
-            wnids = [line.strip() for line in f]
-        self.class_to_idx = {wn: i for i, wn in enumerate(wnids)}
-
-        if train:
-            self._load_train()
-        else:
-            self._load_val()
-
-    def _load_train(self) -> None:
-        train_dir = os.path.join(self.root, "train")
-        for cls_name in os.listdir(train_dir):
-            cls_idx = self.class_to_idx.get(cls_name)
-            if cls_idx is None:
-                continue
-            img_dir = os.path.join(train_dir, cls_name, "images")
-            for fname in os.listdir(img_dir):
-                if fname.lower().endswith((".jpeg", ".jpg", ".png")):
-                    self.samples.append((os.path.join(img_dir, fname), cls_idx))
-                    self.targets.append(cls_idx)
-
-    def _load_val(self) -> None:
-        ann_path = os.path.join(self.root, "val", "val_annotations.txt")
-        img_dir = os.path.join(self.root, "val", "images")
-        with open(ann_path) as f:
-            for line in f:
-                parts = line.strip().split("\t")
-                fname, cls_name = parts[0], parts[1]
-                cls_idx = self.class_to_idx.get(cls_name)
-                if cls_idx is None:
-                    continue
-                self.samples.append((os.path.join(img_dir, fname), cls_idx))
-                self.targets.append(cls_idx)
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int):
-        path, label = self.samples[idx]
-        from PIL import Image
-        img = Image.open(path).convert("RGB")
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, label
+    return transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+    ])
 
 
-# --------------------------------------------------------------------------- #
-# Dataset factory
-# --------------------------------------------------------------------------- #
-
-def get_dataset(
-    name: str,
+def get_imagenet_loader(
     data_root: str,
-    image_size: int = 224,
-) -> tuple[Dataset, Dataset]:
+    batch_size: int = 256,
+    num_workers: int = 8,
+) -> tuple:
     """
-    Return (train_dataset, test_dataset) for the requested dataset.
+    Return (train_dataset, test_dataset) for ImageNet-1000.
+
+    Expects data_root to contain 'train/' and 'val/' subdirectories
+    in the standard torchvision ImageFolder layout:
+        data_root/
+            train/
+                n01440764/  (synset folders)
+                ...
+            val/
+                n01440764/
+                ...
 
     Parameters
     ----------
-    name      : str   dataset identifier (case-insensitive)
-    data_root : str   path where data is stored / will be downloaded
-    image_size: int   spatial resolution to resize images to (default 224)
+    data_root   : str   path to the ImageNet root directory
+    batch_size  : int   (unused here, loaders are built by caller)
+    num_workers : int   (unused here, loaders are built by caller)
 
     Returns
     -------
-    (train_dataset, test_dataset)
+    (train_dataset, val_dataset)  -- both are torchvision ImageFolder datasets
+    """
+    if not os.path.isdir(data_root):
+        raise FileNotFoundError(
+            f"ImageNet root not found: {data_root}\n"
+            "Please set data_root in config.yaml to the directory containing "
+            "'train/' and 'val/' subdirectories."
+        )
+
+    train_dir = os.path.join(data_root, "train")
+    val_dir   = os.path.join(data_root, "val")
+
+    if not os.path.isdir(train_dir):
+        raise FileNotFoundError(f"ImageNet train split not found: {train_dir}")
+    if not os.path.isdir(val_dir):
+        raise FileNotFoundError(f"ImageNet val split not found: {val_dir}")
+
+    train_dataset = datasets.ImageFolder(train_dir, transform=_imagenet_train_transform())
+    val_dataset   = datasets.ImageFolder(val_dir,   transform=_imagenet_val_transform())
+
+    return train_dataset, val_dataset
+
+
+# ---------------------------------------------------------------------------
+# Generic dataset loader for non-paper datasets (extensions only)
+# ---------------------------------------------------------------------------
+
+def get_dataset_generic(
+    name: str,
+    data_root: str,
+    image_size: int = 224,
+) -> tuple:
+    """
+    Load a non-paper dataset for extension experiments.
+
+    These datasets are NOT used in the paper. Results will NOT reproduce
+    the paper's numbers or the Omega_all metric as reported.
+
+    Supported: cifar100, tiny-imagenet
     """
     name = name.lower()
 
+    # Reuse ImageNet normalization since we use an ImageNet-pretrained backbone
+    mean = _IMAGENET_MEAN
+    std  = _IMAGENET_STD
+
     if name in ("cifar100", "cifar-100"):
-        train_tf = get_transforms("cifar100", training=True,  image_size=image_size)
-        test_tf  = get_transforms("cifar100", training=False, image_size=image_size)
-        train_ds = datasets.CIFAR100(
-            data_root, train=True,  download=True, transform=train_tf
-        )
-        test_ds  = datasets.CIFAR100(
-            data_root, train=False, download=True, transform=test_tf
+        train_tf = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        test_tf = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        return (
+            datasets.CIFAR100(data_root, train=True,  download=True, transform=train_tf),
+            datasets.CIFAR100(data_root, train=False, download=True, transform=test_tf),
         )
 
     elif name in ("tiny-imagenet", "tiny_imagenet"):
-        train_tf = get_transforms("tiny-imagenet", training=True,  image_size=image_size)
-        test_tf  = get_transforms("tiny-imagenet", training=False, image_size=image_size)
-        train_ds = TinyImageNet(data_root, train=True,  transform=train_tf)
-        test_ds  = TinyImageNet(data_root, train=False, transform=test_tf)
-
-    elif name == "imagenet":
-        train_tf = get_transforms("imagenet", training=True,  image_size=image_size)
-        test_tf  = get_transforms("imagenet", training=False, image_size=image_size)
-        train_ds = datasets.ImageNet(data_root, split="train", transform=train_tf)
-        test_ds  = datasets.ImageNet(data_root, split="val",   transform=test_tf)
+        train_tf = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        test_tf = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        from torchvision.datasets import ImageFolder
+        train_ds = ImageFolder(os.path.join(data_root, "train"), transform=train_tf)
+        val_ds   = ImageFolder(os.path.join(data_root, "val"),   transform=test_tf)
+        return train_ds, val_ds
 
     else:
         raise NotImplementedError(
-            f"Dataset '{name}' is not implemented.  "
-            f"Supported: cifar100, tiny-imagenet, imagenet."
+            f"Non-paper dataset '{name}' is not implemented. "
+            "Paper uses ImageNet-1000 only. "
+            "Supported extensions: cifar100, tiny-imagenet."
         )
 
-    return train_ds, test_ds
 
+# ---------------------------------------------------------------------------
+# Checkpoint loading helper
+# ---------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------- #
-# Model weight helpers (used when loading partial checkpoints)
-# --------------------------------------------------------------------------- #
-
-def safe_load_dict(model: nn.Module, state_dict: dict) -> None:
+def safe_load_dict(model: torch.nn.Module, state_dict: dict) -> None:
     """
-    Load ``state_dict`` into ``model``, ignoring size-mismatched keys.
-    Useful when loading a backbone checkpoint that still has the FC head.
+    Load state_dict into model, skipping shape-mismatched keys.
+    Used when loading backbone checkpoints that still contain an FC head.
     """
-    own_state = model.state_dict()
-    loaded, skipped = 0, 0
+    own = model.state_dict()
+    loaded = skipped = 0
     for name, param in state_dict.items():
-        if name in own_state:
-            if own_state[name].shape == param.shape:
-                own_state[name].copy_(param)
-                loaded += 1
-            else:
-                print(f"[utils] Shape mismatch for '{name}': "
-                      f"{own_state[name].shape} vs {param.shape}. Skipping.")
-                skipped += 1
+        if name in own and own[name].shape == param.shape:
+            own[name].copy_(param)
+            loaded += 1
         else:
             skipped += 1
-    print(f"[utils] Loaded {loaded} parameter tensors; skipped {skipped}.")
+    print(f"[utils] Loaded {loaded} tensors; skipped {skipped}.")
